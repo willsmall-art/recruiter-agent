@@ -333,13 +333,13 @@ TOV: warm, direct, specific, no corporate fluff. Second person in "about you" se
                   <button
                     key={o.id}
                     onClick={() => {
-                      if (hasGenerated && isReady) {
+                      if (hasGenerated) {
                         setActiveTab(o.id);
-                      } else if (!hasGenerated) {
+                      } else {
                         toggleOutput(o.id);
                       }
                     }}
-                    style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 20, border, background: bg, color, fontSize: 13, fontWeight: 500, cursor: "pointer", opacity: hasGenerated && !isReady ? 0.4 : 1, transition: "all 0.15s" }}
+                    style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 20, border, background: bg, color, fontSize: 13, fontWeight: 500, cursor: "pointer", opacity: 1, transition: "all 0.15s" }}
                   >
                     <span style={{ fontSize: 14 }}>{o.emoji}</span>
                     {o.label}
