@@ -192,21 +192,36 @@ TOV: warm, direct, specific, no corporate fluff. Second person in "about you" se
   };
 
   const parseResult = (text, outputIds) => {
+    const HEADINGS = {
+      jd:      ["## Job Description", "# Job Description", "**Job Description**"],
+      sourcing:["## Sourcing Message", "# Sourcing Message", "**Sourcing Message**"],
+      prep:    ["## Interview Prep", "# Interview Prep", "**Interview Prep**"],
+      post:    ["## LinkedIn Post", "# LinkedIn Post", "**LinkedIn Post**"],
+      boolean: ["## Boolean & X-Ray", "# Boolean & X-Ray", "**Boolean & X-Ray**"],
+      update:  ["## Candidate Update", "# Candidate Update", "**Candidate Update**"],
+    };
     const parsed = {};
+    const allVariants = Object.values(HEADINGS).flat();
     outputIds.forEach((id) => {
-      const heading = SECTION_HEADINGS[id];
-      if (!heading) return;
-      const start = text.indexOf(heading);
+      const variants = HEADINGS[id] || [];
+      let start = -1, headingLen = 0;
+      for (const h of variants) {
+        const idx = text.indexOf(h);
+        if (idx !== -1) { start = idx; headingLen = h.length; break; }
+      }
       if (start === -1) return;
-      const contentStart = start + heading.length;
-      const nextStarts = Object.values(SECTION_HEADINGS)
+      const contentStart = start + headingLen;
+      const nextStarts = allVariants
+        .filter((h) => !variants.includes(h))
         .map((h) => text.indexOf(h, contentStart))
         .filter((i) => i > contentStart);
-      const end = nextStarts.length ? Math.min(...nextStarts) : text.length;
-      parsed[id] = text.slice(contentStart, end).trim();
+      parsed[id] = text.slice(contentStart, nextStarts.length ? Math.min(...nextStarts) : text.length).trim();
     });
+    if (Object.keys(parsed).length === 0 && outputIds.length > 0) {
+      parsed[outputIds[0]] = text.trim();
+    }
     return parsed;
-  };
+  }
 
   const generate = async () => {
     if (!notes.trim()) return;
@@ -333,13 +348,13 @@ TOV: warm, direct, specific, no corporate fluff. Second person in "about you" se
                   <button
                     key={o.id}
                     onClick={() => {
-                      if (hasGenerated) {
+                      if (hasGenerated && isReady) {
                         setActiveTab(o.id);
-                      } else {
+                      } else if (!hasGenerated) {
                         toggleOutput(o.id);
                       }
                     }}
-                    style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 20, border, background: bg, color, fontSize: 13, fontWeight: 500, cursor: "pointer", opacity: 1, transition: "all 0.15s" }}
+                    style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 20, border, background: bg, color, fontSize: 13, fontWeight: 500, cursor: "pointer", opacity: hasGenerated && !isReady ? 0.4 : 1, transition: "all 0.15s" }}
                   >
                     <span style={{ fontSize: 14 }}>{o.emoji}</span>
                     {o.label}
