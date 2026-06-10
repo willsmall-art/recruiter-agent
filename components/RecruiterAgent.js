@@ -1,477 +1,497 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const OUTPUTS = [
-  { id: "jd", label: "Job Description", emoji: "📄" },
-  { id: "sourcing", label: "Sourcing Message", emoji: "💼" },
-  { id: "prep", label: "Interview Prep", emoji: "📋" },
-  { id: "post", label: "LinkedIn Post", emoji: "📣" },
-  { id: "boolean", label: "Boolean & X-Ray", emoji: "🔍" },
-  { id: "update", label: "Candidate Update", emoji: "🗂️" },
-  { id: "silver", label: "Silver Medallists", emoji: "🥈" },
+  { id: "jd",        label: "Job Description",   icon: "📄", keyword: "Job Description" },
+  { id: "sourcing",  label: "Sourcing Message",   icon: "💼", keyword: "Sourcing Message" },
+  { id: "prep",      label: "Interview Prep",     icon: "📋", keyword: "Interview Prep" },
+  { id: "post",      label: "LinkedIn Post",      icon: "📣", keyword: "LinkedIn Post" },
+  { id: "boolean",   label: "Boolean & X-Ray",    icon: "🔍", keyword: "Boolean" },
+  { id: "targets",   label: "Target Companies",   icon: "🎯", keyword: "Target Companies" },
+  { id: "questions", label: "Interview Questions", icon: "💬", keyword: "Interview Questions" },
+  { id: "silver",    label: "Silver Medalists",   icon: null, keyword: null, isAshby: true },
 ];
 
-const SECTION_HEADINGS = {
-  jd:      "## Job Description",
-  sourcing:"## Sourcing Message",
-  prep:    "## Interview Prep",
-  post:    "## LinkedIn Post",
-  boolean: "## Boolean & X-Ray",
-  update:  "## Candidate Update",
-};
+const MINT = "#3ECFA3";
+const NAVY = "#111827";
+const OFF  = "#f7f6f3";
+const ASHBY_ORANGE = "#FF5B35";
+
+const POST_TECHNICAL_STAGES = [
+  "final interview","final stage","second interview","third interview",
+  "culture fit","values interview","executive interview","ceo interview",
+  "offer","reference check","references","background check","contract",
+  "hired","panel interview","panel","presentation","case study",
+  "task review","take home review","senior interview","director interview","vp interview"
+];
+const TECHNICAL_STAGE_NAMES = [
+  "technical interview","technical screen","technical assessment","technical",
+  "tech interview","coding interview","skills test","technical task","take home","take home task"
+];
+
+function isAtOrPastTechnical(s) {
+  if (!s) return false;
+  const sl = s.toLowerCase();
+  return TECHNICAL_STAGE_NAMES.some(t => sl.includes(t)) || POST_TECHNICAL_STAGES.some(t => sl.includes(t));
+}
+
+const AshbyLogo = ({ size = 16 }) => (
+  <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
+    <rect width="32" height="32" rx="6" fill={ASHBY_ORANGE}/>
+    <path d="M16 7L22.5 19.5H9.5L16 7Z" fill="white"/>
+    <circle cx="16" cy="23" r="3" fill="white"/>
+  </svg>
+);
+
+function parseSections(text, activeIds) {
+  const active = OUTPUTS.filter(o => activeIds.includes(o.id) && !o.isAshby);
+  if (!active.length) return [{ id: "all", label: "Output", content: text }];
+  const boundaries = [];
+  for (const o of active) {
+    const regex = new RegExp(`(^|\\n)[\\s#*_]*${o.keyword.replace(/&/g,"(&|and)")}[\\s#*_]*`,"i");
+    const match = regex.exec(text);
+    if (match) boundaries.push({ id: o.id, index: match.index + (match[1] ? 1 : 0) });
+  }
+  boundaries.sort((a,b) => a.index - b.index);
+  if (!boundaries.length) return [{ id: active[0].id, label: active[0].label, icon: active[0].icon, content: text }];
+  const sections = [];
+  for (let i = 0; i < boundaries.length; i++) {
+    const o = OUTPUTS.find(x => x.id === boundaries[i].id);
+    sections.push({ id: o.id, label: o.label, icon: o.icon, content: text.slice(boundaries[i].index, boundaries[i+1]?.index ?? text.length).trim() });
+  }
+  if (boundaries[0].index > 0) { const pre = text.slice(0, boundaries[0].index).trim(); if (pre) sections[0].content = pre + "\n\n" + sections[0].content; }
+  return sections;
+}
+
+// ── Ashby calls go through /api/ashby (server-side, no CORS) ─────────────────
+async function ashbyFetch(apiKey, endpoint, body = {}) {
+  const res = await fetch("/api/ashby", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint, body, apiKey }),
+  });
+  const data = await res.json();
+  if (!res.ok || data?.error) throw new Error(data?.error || `HTTP ${res.status}`);
+  return data;
+}
+
+async function ashbyListAll(apiKey, endpoint, extraBody = {}, maxPages = 5) {
+  let results = [], cursor = null, page = 0;
+  do {
+    const data = await ashbyFetch(apiKey, endpoint, { limit: 100, ...extraBody, ...(cursor ? { cursor } : {}) });
+    results = results.concat(data.results || []);
+    cursor = data.nextCursor || null; page++;
+  } while (cursor && page < maxPages);
+  return results;
+}
+
+async function extractRoleTitle(notes) {
+  const lines = notes.split("\n").map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const m = line.match(/^(?:role|title|position|job title|hiring for)[:\s\-]+(.{3,60})$/i);
+    if (m) return m[1].trim();
+  }
+  for (const line of lines) {
+    if (line.length >= 5 && line.length <= 60 && /^[A-Z]/.test(line) && line.split(" ").length <= 6 && !line.includes(",") && !line.includes(".")) return line;
+  }
+  const res = await fetch("/api/anthropic", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: `What is the job title in these hiring notes? Reply with ONLY the job title, nothing else.\n\n${notes.slice(0,400)}`, maxTokens: 30 }) });
+  const data = await res.json();
+  return data.text?.trim().replace(/^["']|["']$/g,"") || "this role";
+}
+
+async function getSimilarTitles(roleTitle) {
+  const res = await fetch("/api/anthropic", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: `List 6 alternative job titles for "${roleTitle}". Return ONLY a JSON array of short title strings, nothing else.`, maxTokens: 200 }) });
+  const data = await res.json();
+  try {
+    const t = data.text || "[]";
+    const s = t.indexOf("["), e = t.lastIndexOf("]");
+    if (s === -1 || e === -1) return [roleTitle];
+    const arr = JSON.parse(t.slice(s, e+1));
+    return arr.filter(x => typeof x === "string" && x.length < 60 && !x.includes("."));
+  } catch { return [roleTitle]; }
+}
+
+function titleMatches(jobTitle, targets) {
+  const jt = jobTitle.toLowerCase().trim();
+  return targets.some(t => {
+    const target = t.toLowerCase().trim();
+    if (!target || target.length < 3) return false;
+    const words = target.split(/\s+/).filter(w => w.length > 3);
+    return jt === target || jt.includes(target) || target.includes(jt) ||
+      (words.length > 0 && words.filter(w => jt.includes(w)).length >= Math.ceil(words.length * 0.6));
+  });
+}
+
+async function runFullAshbySearch(apiKey, notes, onProgress) {
+  onProgress("Extracting job title from notes…");
+  const roleTitle = await extractRoleTitle(notes);
+  onProgress(`Searching for "${roleTitle}" and similar titles…`);
+  const similarTitles = await getSimilarTitles(roleTitle);
+  const allTitles = [roleTitle, ...similarTitles];
+  onProgress(`Fetching all Ashby jobs…`);
+  const allJobs = await ashbyListAll(apiKey, "job.list", {}, 10);
+  const matchedJobs = allJobs.filter(job => titleMatches(job.title || "", allTitles));
+  if (!matchedJobs.length) return { candidates: [], roleTitle, allTitles, matchedJobs: [], totalApps: 0 };
+  onProgress(`Found ${matchedJobs.length} matching job${matchedJobs.length !== 1 ? "s" : ""} — fetching applications…`);
+  const silverMedalists = []; let totalApps = 0;
+  for (const job of matchedJobs.slice(0, 20)) {
+    try {
+      for (const status of ["Archived", "Active"]) {
+        const apps = await ashbyListAll(apiKey, "application.list", { jobId: job.id, status }, 5);
+        totalApps += apps.length;
+        for (const app of apps) {
+          if (app.status === "Hired" || app.currentInterviewStageName?.toLowerCase() === "hired") continue;
+          const currentStage = app.currentInterviewStageName || app.interviewStageName || "";
+          const stageHistory = [
+            ...(app.interviewStages || []).map(s => s.name || s.title || ""),
+            ...(app.interviews || []).map(s => s.interviewStageName || s.stageName || ""),
+            ...(app.applicationHistory || []).map(s => s.stageName || s.name || ""),
+          ];
+          const allStages = [currentStage, ...stageHistory].filter(Boolean);
+          if (allStages.some(s => isAtOrPastTechnical(s))) {
+            const dup = silverMedalists.some(sm => (sm.candidateId || sm.candidate?.id) === (app.candidateId || app.candidate?.id) && sm._jobTitle === job.title);
+            if (!dup) silverMedalists.push({ ...app, _jobTitle: job.title, _jobStatus: job.status || "Unknown", _stageFound: allStages.find(s => isAtOrPastTechnical(s)) || currentStage });
+          }
+        }
+      }
+    } catch(e) { console.warn(`Skipping ${job.id}:`, e.message); }
+  }
+  silverMedalists.sort((a,b) => new Date(b.updatedAt||0) - new Date(a.updatedAt||0));
+  onProgress(null);
+  return { candidates: silverMedalists, roleTitle, allTitles, matchedJobs, totalApps };
+}
 
 export default function RecruiterAgent() {
   const [notes, setNotes] = useState("");
-  const [selected, setSelected] = useState(
-    Object.fromEntries(OUTPUTS.map((o) => [o.id, true]))
-  );
-  const [generated, setGenerated] = useState({});
-  const [activeTab, setActiveTab] = useState(null);
+  const [selected, setSelected] = useState(Object.fromEntries(OUTPUTS.map(o => [o.id, true])));
   const [loading, setLoading] = useState(false);
-  const [loadingStatus, setLoadingStatus] = useState("");
+  const [sections, setSections] = useState(null);
+  const [activeTab, setActiveTab] = useState(null);
   const [error, setError] = useState(null);
-  const [expandedCandidate, setExpandedCandidate] = useState(null);
-  const [copiedSection, setCopiedSection] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [ashbyKey, setAshbyKey] = useState("");
+  const [ashbyKeyInput, setAshbyKeyInput] = useState("");
+  const [ashbyKeySaved, setAshbyKeySaved] = useState(false);
+  const [ashbyLoading, setAshbyLoading] = useState(false);
+  const [ashbyProgress, setAshbyProgress] = useState("");
+  const [ashbyResults, setAshbyResults] = useState(null);
+  const [ashbyError, setAshbyError] = useState(null);
+  const contentRef = useRef(null);
 
-  const hasGenerated = Object.keys(generated).filter((k) => k !== "_raw").length > 0;
+  // Load Ashby key from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem("ashby_api_key");
+    if (saved) { setAshbyKey(saved); setAshbyKeySaved(true); }
+  }, []);
 
-  const toggleOutput = (id) => {
-    setSelected((prev) => ({ ...prev, [id]: !prev[id] }));
+  const activeOutputs = OUTPUTS.filter(o => selected[o.id]);
+  const allSelected = activeOutputs.length === OUTPUTS.length;
+  const silverSelected = selected["silver"];
+
+  const toggleOutput = id => setSelected(p => ({ ...p, [id]: !p[id] }));
+  const toggleAll = () => setSelected(Object.fromEntries(OUTPUTS.map(o => [o.id, !allSelected])));
+
+  const buildPrompt = () => {
+    const aiOutputs = activeOutputs.filter(o => !o.isAshby);
+    const sel = id => aiOutputs.some(o => o.id === id);
+    let prompt = `Street Group AI Recruiter Agent. Produce only the requested outputs, clearly labelled with exact heading names.\n\nOUTPUTS NEEDED: ${aiOutputs.map(o=>o.label).join(", ")}\n\nKICKOFF NOTES:\n${notes}\n\n---\n`;
+    if (sel("jd")) prompt += `\nJOB DESCRIPTION: Job title + 📍 location + 💰 salary | Company intro (use boilerplate below) | Role hook (2–3 sentences) | A bit about you (2nd person bullets) | What you'll be working on (action bullets) | D&I nudge (verbatim): "We recognise that women and people from underrepresented groups often only apply for jobs when they meet every single one of the requirements listed. If you fall into that category and are about to rule yourself out based on the above criteria; please consider applying anyway. We'd love to see your application!" | Who are Street Group? (boilerplate) | Why join us? (benefits list) | Salary caveat | Interview process + (verbatim): "We want to make our interviews as inclusive as possible, so if you need any adjustments made, or if there's anything you think we should be aware of during the interview process, please do let us know!" | AI note (verbatim): "As a fast-moving and rapidly evolving tech company, we embrace the advantages of AI and encourage its use throughout our application process. However, our goal is to get to know and hire the authentic you - your skills, experience, and values. We don't want to hire an AI-generated version of you. We consider AI to be a valuable tool, not something that should overshadow you as an individual."\n`;
+    if (sel("sourcing")) prompt += `\nSOURCING MESSAGE: <100 words. Warm, direct, role-specific. [CANDIDATE NAME] placeholder. Don't open with "I hope this message finds you well". Soft CTA at end.\n`;
+    if (sel("prep")) prompt += `\nINTERVIEW PREP: Role summary (3 sentences) | What great looks like (3–5 bullets) | 8 tailored questions with what to listen for | Red flags | Scoring guide (1–5).\n`;
+    if (sel("post")) prompt += `\nLINKEDIN POST: Two options — Option 1: <80 words punchy. Option 2: 100–150 words storytelling. Both: short sentences, warm, 1–3 emojis max, [RECRUITER NAME] placeholder, 2–3 hashtags. Never open with "Excited to share" or "We're hiring!". No exclamation marks on every line.\n`;
+    if (sel("boolean")) prompt += `\nBOOLEAN & X-RAY: LinkedIn Boolean string (1 line) | Google X-Ray string (1 line) | 4 alternative title variants with 1-line notes each | Note: confirm min 3 years experience at screening.\n`;
+    if (sel("targets")) prompt += `\nTARGET COMPANIES: Using the role, seniority and skills from the kickoff notes, list 30 companies where this type of person is likely working now. Industry doesn't matter — focus on fit for THIS role. Include SaaS, fintech, healthtech, ecommerce, agencies, scale-ups with strong cultures. Geography: Manchester/NW first (MediaCityUK, Spinningfields, Salford, Stockport), then Leeds/Sheffield/Liverpool, then UK remote-first. For each: company + location | why strong source for this role (2 sentences, reference specific skills from notes) | team to target | culture fit note (1 sentence). Numbered 1–30.\n`;
+    if (sel("questions")) prompt += `\nINTERVIEW QUESTIONS: 10 questions specific to this role and kickoff notes — no generic questions. Mix: behavioural, situational, technical, motivational. Progressive difficulty. For each: bold question + "What to listen for:" with 2–3 strong-answer indicators.\n`;
+    if (sel("jd")) prompt += `\n---\nSTREET GROUP BOILERPLATE: "We're an award-winning PropTech business based in Manchester, founded in 2015 by brother and sister duo, Tom & Heather Staff. Most of us have personal experience of how painful moving can be, and Tom and Heather saw an opportunity to change this: utilising technology, as well as our incredibly talented team, to improve the industry for everyone. Our products, Street.co.uk and Spectre form a powerful duo, working harmoniously together to transform an agent's job. From securing more leads and winning new instructions to streamlining business operations and growing market share, our products are supercharging 1,000s of agencies across the UK. Back in 2015, our co-Founder, Tom Staff, spent his evenings building Spectre v1.0. He'd seen first-hand an opportunity to automate the very manual process of winning new business for estate agents. Spectre is now our multi award-winning, instruction generation tool, generating an average return on investment for them of over 3000%."\n\nBENEFITS: 🏠 Hybrid-working (4 days WFH) | 🏖️ £1000 holiday after year 1 | 💪 Culture supporting growth | 📚 £500 L&D budget | 🎂 Birthday off | 🙋 2 paid volunteering days | 👶 Enhanced parental pay | 🧠 Mental health support (Health Assured) | 🕒 Flexible hours | 🚂 Season ticket loans | 🌷 Paid menopause leave | 🌞 Holiday buying scheme | 🚀 Ambitious growing business | 👩🏿‍💻 Cutting-edge tech | 🐶 Office dogs | 🍻 Stocked fridge + Friday beers | 🎊 Offsites & events | 🚴 Cycle to work | 🚗 EV salary sacrifice | 🌍 Climate-positive\n`;
+    prompt += `\n---\nTOV: warm, direct, no corporate fluff. Second person in candidate-facing sections.\nEach section heading must exactly match its output name.`;
+    return prompt;
   };
 
-  // All Ashby calls go through our server-side proxy — no CORS issues
-  const ashbyPost = async (endpoint, body) => {
-    const res = await fetch("/api/ashby", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint, body }),
-    });
-    const json = await res.json();
-    if (!res.ok) throw new Error(`Ashby error: ${JSON.stringify(json)}`);
-    return json;
+  const estimateMaxTokens = () => {
+    const aiOutputs = activeOutputs.filter(o => !o.isAshby);
+    const tokenMap = { jd:1200, sourcing:200, prep:800, post:400, boolean:300, targets:1800, questions:900 };
+    return Math.min(Math.max(aiOutputs.reduce((s,o) => s+(tokenMap[o.id]||400), 200), 500), 6000);
   };
-
-  const fetchSilverMedallists = async () => {
-    setLoadingStatus("Searching Ashby for silver medallists…");
-
-    let allApplications = [];
-    let cursor = null;
-    let hasMore = true;
-    while (hasMore) {
-      const body = { limit: 100 };
-      if (cursor) body.cursor = cursor;
-      const data = await ashbyPost("/application.list", body);
-      allApplications = [...allApplications, ...(data.results || [])];
-      cursor = data.moreDataAvailable ? data.nextCursor : null;
-      hasMore = !!cursor && allApplications.length < 500;
-    }
-
-    const poorFit = ["poor culture fit", "culture fit", "not a culture fit", "cultural fit"];
-    const stageOrder = ["screening call","first interview","second interview","third interview","final interview","assessment","task","offer","hired"];
-
-    const passedScreening = allApplications.filter((app) => {
-      const stage = (app.currentInterviewStageName || app.interviewStageName || "").toLowerCase();
-      const passedStage = stageOrder.some((s) => stage.includes(s));
-      const isArchived = app.status === "Archived" || app.archived === true;
-      const reason = (app.archiveReason?.name || app.archiveReasonName || app.dispositionReason || "").toLowerCase();
-      return passedStage && isArchived && !poorFit.some((p) => reason.includes(p));
-    });
-
-    if (passedScreening.length === 0) return [];
-
-    setLoadingStatus("Fetching candidate details from Ashby…");
-    const candidateIds = [...new Set(passedScreening.map((a) => a.candidateId).filter(Boolean))];
-    const candidateDetails = {};
-    for (let i = 0; i < Math.min(candidateIds.length, 50); i += 10) {
-      await Promise.all(
-        candidateIds.slice(i, i + 10).map(async (id) => {
-          try {
-            const d = await ashbyPost("/candidate.info", { id });
-            if (d.results) candidateDetails[id] = d.results;
-          } catch { /* skip */ }
-        })
-      );
-    }
-
-    const enriched = passedScreening.slice(0, 50).map((app) => {
-      const c = candidateDetails[app.candidateId] || {};
-      return {
-        id: app.candidateId || app.id,
-        name: c.name || app.candidateName || "Unknown",
-        email: c.primaryEmailAddress?.value || c.email || "",
-        currentTitle: c.headline || c.currentTitle || "",
-        currentCompany: c.currentCompany || "",
-        previousRole: app.jobPostingName || app.jobTitle || "",
-        stageReached: app.currentInterviewStageName || app.interviewStageName || "",
-        appliedAt: app.createdAt ? new Date(app.createdAt).toLocaleDateString("en-GB", { month: "short", year: "numeric" }) : "",
-        archiveReason: app.archiveReason?.name || app.archiveReasonName || "Not specified",
-      };
-    });
-
-    setLoadingStatus("Ranking candidates against your kickoff notes…");
-    const prompt = `You are a recruiter's assistant at Street Group. Score and rank the top 10 most relevant silver medallist candidates against the hiring kickoff notes below. Return ONLY a JSON array, no other text.
-
-HIRING KICKOFF NOTES:
-${notes}
-
-CANDIDATES:
-${JSON.stringify(enriched, null, 2)}
-
-Return format:
-[{"id":"","name":"","email":"","currentTitle":"","currentCompany":"","previousRole":"","stageReached":"","appliedAt":"","archiveReason":"","matchScore":85,"matchReason":"2-3 sentences","suggestedOutreach":"Warm re-engagement message under 80 words, [CANDIDATE NAME] placeholder, no 'I hope this finds you well', soft CTA at end."}]`;
-
-    const r = await fetch("/api/claude", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 3000, messages: [{ role: "user", content: prompt }] }),
-    });
-    const d = await r.json();
-    const txt = d.content?.map((b) => b.text || "").join("") || "";
-    return JSON.parse(txt.replace(/```json|```/g, "").trim());
-  };
-
-  const buildPrompt = (outputIds) => {
-    const sections = outputIds.map((id) => SECTION_HEADINGS[id]).filter(Boolean).join(", ");
-    return `You are the Street Group AI Recruiter Agent. Produce the requested outputs from the hiring kickoff notes below. Use the EXACT section headings listed — they are used to parse your response, so do not alter them.
-
-Sections to generate: ${sections}
-
-For each section, begin with its heading on its own line (e.g. "## Job Description"), then write the content. Do not add any text before the first heading.
-
-HIRING KICKOFF NOTES:
-${notes}
-
----
-
-OUTPUT INSTRUCTIONS:
-
-## Job Description
-Structure: Job title + 📍 location/WFH + 💰 salary | Company intro (boilerplate below) | Role hook 2-3 sentences | A bit about you (second person, flowing bullets) | Here's what you can expect to be working on (action-led bullets) | D&I nudge (verbatim): "We recognise that women and people from underrepresented groups often only apply for jobs when they meet every single one of the requirements listed. If you fall into that category and are about to rule yourself out based on the above criteria; please consider applying anyway. We'd love to see your application!" | Who are Street Group? (boilerplate) | Why join Street Group? (benefits list) | Salary caveat | Interview process + inclusive interviews line (verbatim): "We want to make our interviews as inclusive as possible, so if you need any adjustments made, or if there's anything you think we should be aware of during the interview process, please do let us know!" | AI note (verbatim): "As a fast-moving and rapidly evolving tech company, we embrace the advantages of AI and encourage its use throughout our application process. However, our goal is to get to know and hire the authentic you - your skills, experience, and values. We don't want to hire an AI-generated version of you. We consider AI to be a valuable tool, not something that should overshadow you as an individual."
-
-## Sourcing Message
-Under 100 words. Warm and direct. Role-specific. [CANDIDATE NAME] placeholder. Does NOT start with "I hope this message finds you well". Ends with soft CTA.
-
-## Interview Prep
-Role summary (3 sentences) | What great looks like (3-5 bullets) | 8 tailored interview questions with what to listen for | Red flags | Scoring guide (1-5 scale).
-
-## LinkedIn Post
-Option 1: Short and punchy under 80 words. Option 2: Storytelling 100-150 words. Both: short sentences, warm and human, 1-3 emojis max, [RECRUITER NAME] placeholder, 2-3 hashtags. NEVER open with "Excited to share", "We're hiring!", or hype openers. No exclamation marks on every sentence.
-
-## Boolean & X-Ray
-LinkedIn Boolean string (single line) | Google X-Ray string (single line) | 4 alternative job title variants with one-line notes | Screening note: Minimum 3 years experience — must be confirmed at screening.
-
-## Candidate Update
-3 email templates: one post-interview update, one holding message, one rejection with care.
-
----
-
-Street Group boilerplate: "We're an award-winning PropTech business based in Manchester, founded in 2015 by brother and sister duo, Tom & Heather Staff. Most of us have personal experience of how painful moving can be, and Tom and Heather saw an opportunity to change this: utilising technology, as well as our incredibly talented team, to improve the industry for everyone. Our products, Street.co.uk and Spectre form a powerful duo, working harmoniously together to transform an agent's job. From securing more leads and winning new instructions to streamlining business operations and growing market share, our products are supercharging 1,000s of agencies across the UK. Back in 2015, our co-Founder, Tom Staff, spent his evenings building Spectre v1.0. He'd seen first-hand an opportunity to automate the very manual process of winning new business for estate agents. Spectre is now our multi award-winning, instruction generation tool, generating an average return on investment for them of over 3000%."
-
-Benefits:
-🏠 Hybrid-working - up to 4 days WFH
-🏖️ £1000 holiday allowance after year one
-💪 Culture that supports development and growth
-📚 £500 yearly L&D budget
-🎂 Birthday off
-🙋 2 paid volunteering days
-👶 Enhanced maternity, paternity & adoption pay
-🧠 Mental health support via Health Assured
-🕒 Flexible working hours
-🚂 Season ticket loans
-🌷 Paid menopause leave
-🌞 Holiday buying scheme
-🚀 Exciting business with huge ambition
-👩🏿‍💻 Cutting-edge technology
-🐶 Office dogs welcome
-🍻 Stocked fridge and beers on Fridays
-🎊 Company off-sites and events
-🚴 Cycle to work scheme
-🚗 Electric car salary sacrifice
-🌍 Climate-positive company
-
-TOV: warm, direct, specific, no corporate fluff. Second person in "about you" section.`;
-  };
-
-  const parseResult = (text, outputIds) => {
-    const HEADINGS = {
-      jd:      ["## Job Description", "# Job Description", "**Job Description**"],
-      sourcing:["## Sourcing Message", "# Sourcing Message", "**Sourcing Message**"],
-      prep:    ["## Interview Prep", "# Interview Prep", "**Interview Prep**"],
-      post:    ["## LinkedIn Post", "# LinkedIn Post", "**LinkedIn Post**"],
-      boolean: ["## Boolean & X-Ray", "# Boolean & X-Ray", "**Boolean & X-Ray**"],
-      update:  ["## Candidate Update", "# Candidate Update", "**Candidate Update**"],
-    };
-    const parsed = {};
-    const allVariants = Object.values(HEADINGS).flat();
-    outputIds.forEach((id) => {
-      const variants = HEADINGS[id] || [];
-      let start = -1, headingLen = 0;
-      for (const h of variants) {
-        const idx = text.indexOf(h);
-        if (idx !== -1) { start = idx; headingLen = h.length; break; }
-      }
-      if (start === -1) return;
-      const contentStart = start + headingLen;
-      const nextStarts = allVariants
-        .filter((h) => !variants.includes(h))
-        .map((h) => text.indexOf(h, contentStart))
-        .filter((i) => i > contentStart);
-      parsed[id] = text.slice(contentStart, nextStarts.length ? Math.min(...nextStarts) : text.length).trim();
-    });
-    if (Object.keys(parsed).length === 0 && outputIds.length > 0) {
-      parsed[outputIds[0]] = text.trim();
-    }
-    return parsed;
-  }
 
   const generate = async () => {
-    if (!notes.trim()) return;
-    setLoading(true);
-    setError(null);
-    setGenerated({});
-    setActiveTab(null);
-    setExpandedCandidate(null);
-
-    const textIds = OUTPUTS.filter((o) => o.id !== "silver" && selected[o.id]).map((o) => o.id);
-    const silverEnabled = selected.silver;
-
-    try {
-      const newGenerated = {};
-      const tasks = [];
-
-      if (textIds.length > 0) {
-        setLoadingStatus("Generating your outputs…");
-        tasks.push((async () => {
-          const res = await fetch("/api/claude", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: "claude-sonnet-4-20250514",
-              max_tokens: 4000,
-              messages: [{ role: "user", content: buildPrompt(textIds) }],
-            }),
-          });
-          const data = await res.json();
-          const text = data.content?.map((b) => b.text || "").join("") || "";
-          Object.assign(newGenerated, parseResult(text, textIds));
-          newGenerated._raw = text;
-        })());
-      }
-
-      if (silverEnabled) {
-        tasks.push((async () => {
-          try {
-            newGenerated.silver = await fetchSilverMedallists();
-          } catch (e) {
-            newGenerated.silver = { error: `Couldn't fetch silver medallists: ${e.message}` };
-          }
-        })());
-      }
-
-      await Promise.all(tasks);
-      setGenerated(newGenerated);
-      setActiveTab(null);
-    } catch (e) {
-      setError("Something went wrong. Please try again.");
+    if (!notes.trim() || !activeOutputs.length) return;
+    setLoading(true); setSections(null); setAshbyResults(null); setAshbyError(null); setError(null);
+    const aiOutputs = activeOutputs.filter(o => !o.isAshby);
+    let parsedSections = [];
+    if (aiOutputs.length) {
+      try {
+        const res = await fetch("/api/anthropic", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: buildPrompt(), maxTokens: estimateMaxTokens() }) });
+        const data = await res.json();
+        parsedSections = parseSections(data.text || "", aiOutputs.map(o => o.id));
+      } catch { setError("Generation failed. Please try again."); setLoading(false); return; }
     }
-
-    setLoadingStatus("");
+    if (silverSelected) parsedSections.push({ id: "silver", label: "Silver Medalists", icon: null, isAshby: true });
+    setSections(parsedSections);
+    setActiveTab(parsedSections[0]?.id ?? null);
     setLoading(false);
+    if (silverSelected && ashbyKeySaved && ashbyKey) doAshbySearch(ashbyKey);
   };
 
-  const copySection = (id) => {
-    const c = generated[id];
-    if (!c) return;
-    navigator.clipboard.writeText(typeof c === "string" ? c : JSON.stringify(c, null, 2));
-    setCopiedSection(id);
-    setTimeout(() => setCopiedSection(null), 2000);
+  const doAshbySearch = async (key) => {
+    setAshbyLoading(true); setAshbyResults(null); setAshbyError(null);
+    try {
+      const results = await runFullAshbySearch(key, notes, msg => setAshbyProgress(msg || ""));
+      setAshbyResults(results);
+    } catch(e) {
+      let msg = e.message || "Unknown error";
+      if (msg.includes("401") || msg.includes("403")) msg = "Invalid API key or missing permissions. Check candidatesRead + jobsRead in Ashby (Admin → Integrations → API Keys).";
+      setAshbyError(msg);
+    }
+    setAshbyProgress(""); setAshbyLoading(false);
   };
 
-  const scoreColor = (s) => s >= 80 ? "#16a34a" : s >= 60 ? "#d97706" : "#dc2626";
-  const scoreBg = (s) => s >= 80 ? "#f0fdf4" : s >= 60 ? "#fffbeb" : "#fef2f2";
-  const activeOutput = OUTPUTS.find((o) => o.id === activeTab);
+  const saveAshbyKey = () => {
+    if (!ashbyKeyInput.trim()) return;
+    const key = ashbyKeyInput.trim();
+    setAshbyKey(key); setAshbyKeySaved(true);
+    localStorage.setItem("ashby_api_key", key);
+  };
+
+  const removeAshbyKey = () => {
+    setAshbyKeySaved(false); setAshbyKey(""); setAshbyKeyInput("");
+    localStorage.removeItem("ashby_api_key");
+  };
+
+  const currentSection = sections?.find(s => s.id === activeTab);
+  const tabIdx = sections ? sections.findIndex(s => s.id === activeTab) : -1;
+
+  const handleCopy = () => { navigator.clipboard.writeText(currentSection?.content ?? ""); setCopied(true); setTimeout(() => setCopied(false), 2000); };
+  const handleCopyAll = () => { navigator.clipboard.writeText(sections?.filter(s => !s.isAshby).map(s => s.content).join("\n\n---\n\n") ?? ""); setCopied(true); setTimeout(() => setCopied(false), 2000); };
+
+  useEffect(() => { if (contentRef.current) contentRef.current.scrollTop = 0; }, [activeTab]);
+  useEffect(() => { if (activeTab === "silver" && ashbyKeySaved && ashbyKey && !ashbyResults && !ashbyLoading && !ashbyError && notes) doAshbySearch(ashbyKey); }, [activeTab]);
 
   return (
-    <div style={{ fontFamily: "'Inter', system-ui, sans-serif", minHeight: "100vh", background: "#f0eeeb", color: "#1a1a2e", display: "flex", flexDirection: "column" }}>
+    <div style={{ fontFamily:"'DM Sans','Inter',system-ui,sans-serif", minHeight:"100vh", background:OFF, color:NAVY }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+        @keyframes spin { to { transform:rotate(360deg); } }
+        @keyframes fadeUp { from { opacity:0;transform:translateY(10px); } to { opacity:1;transform:translateY(0); } }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+        .sg-toggle { transition:all .15s; }
+        .sg-toggle:hover { border-color:#3ECFA3!important; }
+        .sg-toggle.on { background:#edfaf5!important;border-color:#3ECFA3!important;color:#0a5c44!important; }
+        .sg-toggle.on .dot { background:#3ECFA3!important; }
+        .sg-tab { transition:all .15s;cursor:pointer; }
+        .sg-tab:hover { border-color:#3ECFA3!important;color:#0a5c44!important;background:#edfaf5!important; }
+        .sg-tab.active { background:#edfaf5!important;border-color:#3ECFA3!important;color:#0a5c44!important; }
+        .sg-tab.active .tab-dot { background:#3ECFA3!important; }
+        .sg-generate:hover:not(:disabled) { transform:translateY(-1px);box-shadow:0 8px 24px rgba(62,207,163,.3)!important; }
+        .sg-sec:hover { border-color:#3ECFA3!important;color:#0a5c44!important;background:#f0fdf8!important; }
+        textarea:focus,input:focus { outline:none;border-color:#3ECFA3!important;box-shadow:0 0 0 3px rgba(62,207,163,.12)!important; }
+        .fade { animation:fadeUp .35s ease; }
+        .cand-row:hover { background:#f7f6f3!important; }
+        .title-pill { font-size:11px;background:#edfaf5;border:1px solid #3ECFA3;color:#0a5c44;padding:2px 8px;border-radius:100px;font-weight:600; }
+      `}</style>
 
-      {/* Header */}
-      <div style={{ background: "#1a1a2e", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: "#e8440a", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 14, color: "#fff" }}>S</div>
-          <span style={{ fontWeight: 600, fontSize: 15, color: "#fff" }}>Street Group</span>
+      <nav style={{ background:NAVY, padding:"0 24px", height:60, display:"flex", alignItems:"center", justifyContent:"space-between", position:"sticky", top:0, zIndex:20 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <svg width="32" height="32" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="8" fill={MINT}/><path d="M8 11C8 11 10 9 14 9C18 9 20 12 16 14C12 16 10 17 10 20C10 22 12 23 16 23C19 23 21 22 22 21" stroke={NAVY} strokeWidth="2.5" strokeLinecap="round"/></svg>
+          <span style={{ fontWeight:700, fontSize:16, color:"#fff", letterSpacing:"-0.02em" }}>Street Group</span>
         </div>
-        <div style={{ border: "1.5px solid #e8440a", color: "#e8440a", fontSize: 12, fontWeight: 600, padding: "4px 14px", borderRadius: 20 }}>Recruiter Agent</div>
-      </div>
-
-      {/* Body */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "28px 20px" }}>
-
-        {!hasGenerated && !loading && (
-          <>
-            <h1 style={{ fontSize: 26, fontWeight: 700, margin: "0 0 6px" }}>Hiring kickoff</h1>
-            <p style={{ fontSize: 14, color: "#888", margin: "0 0 24px", lineHeight: 1.5 }}>Paste your kickoff notes once — every output is generated automatically.</p>
-          </>
-        )}
-
-        {!loading && (
-          <div style={{ background: "#fff", borderRadius: 16, padding: "20px", boxShadow: "0 1px 4px rgba(0,0,0,0.06)", marginBottom: 24 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", color: "#aaa", textTransform: "uppercase" }}>KICKOFF NOTES</div>
-              {hasGenerated && (
-                <button onClick={() => { setGenerated({}); setActiveTab(null); }} style={{ background: "#fff", border: "1px solid #e8e8e8", color: "#666", fontSize: 12, padding: "4px 12px", borderRadius: 16, cursor: "pointer" }}>← New role</button>
-              )}
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          {ashbyKeySaved && (
+            <div style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(62,207,163,.15)", border:"1px solid rgba(62,207,163,.4)", borderRadius:100, padding:"4px 10px" }}>
+              <AshbyLogo size={13}/>
+              <span style={{ color:MINT, fontSize:11, fontWeight:600 }}>Ashby connected</span>
+              <button onClick={removeAshbyKey} style={{ background:"none", border:"none", color:"rgba(62,207,163,.6)", fontSize:11, cursor:"pointer", padding:"0 0 0 4px", fontFamily:"inherit" }} title="Remove key">✕</button>
             </div>
+          )}
+          <div style={{ background:"rgba(62,207,163,.15)", border:"1px solid rgba(62,207,163,.4)", color:MINT, fontSize:11, fontWeight:600, padding:"5px 14px", borderRadius:100, letterSpacing:"0.06em", textTransform:"uppercase" }}>Recruiter Agent</div>
+        </div>
+      </nav>
 
-            <div style={{ border: "1px solid #e8e8e8", borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
-              <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder="Role title, team, salary, responsibilities, must-haves, interview process..."
-                style={{ width: "100%", minHeight: hasGenerated ? 80 : 160, background: "transparent", border: "none", outline: "none", color: "#1a1a2e", fontSize: 14, lineHeight: 1.6, resize: "vertical", fontFamily: "inherit", boxSizing: "border-box" }}
-              />
+      <div style={{ maxWidth:700, margin:"0 auto", padding:"0 20px 60px" }}>
+        {!sections && !loading && (
+          <div className="fade">
+            <div style={{ padding:"44px 0 32px", position:"relative" }}>
+              <svg style={{ position:"absolute", top:16, right:-8, opacity:.1 }} width="120" height="90" viewBox="0 0 120 90" fill="none"><path d="M10 75 C 20 15, 60 15, 60 45 C 60 75, 100 75, 110 15" stroke={MINT} strokeWidth="4" strokeLinecap="round" fill="none"/></svg>
+              <p style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:MINT, margin:"0 0 10px" }}>Hiring Kickoff</p>
+              <h1 style={{ fontSize:34, fontWeight:700, margin:"0 0 12px", color:NAVY, lineHeight:1.15, letterSpacing:"-0.03em" }}>Generate everything.<br/><span style={{ color:MINT }}>In one go.</span></h1>
+              <p style={{ fontSize:15, color:"#6b7280", margin:0, lineHeight:1.6 }}>Paste your kickoff notes — job description, sourcing, interview prep and more, ready instantly.</p>
             </div>
-
-            {/* Toggle buttons */}
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 20 }}>
-              {OUTPUTS.map((o) => {
-                const isOn = selected[o.id];
-                const isReady = hasGenerated && (o.id === "silver" ? generated.silver !== undefined : !!generated[o.id]);
-                const isActive = activeTab === o.id;
-
-                let border = "1.5px solid #e8e8e8";
-                let bg = "#f7f7f7";
-                let color = "#999";
-                if (isActive)     { border = "1.5px solid #e8440a"; bg = "#fff5f2"; color = "#e8440a"; }
-                else if (isReady) { border = "1.5px solid #d0cfe8"; bg = "#f0effe"; color = "#5b5bd6"; }
-                else if (isOn)    { border = "1.5px solid #d0cfe8"; bg = "#f0effe"; color = "#5b5bd6"; }
-
-                return (
-                  <button
-                    key={o.id}
-                    onClick={() => {
-                      if (hasGenerated && isReady) {
-                        setActiveTab(o.id);
-                      } else if (!hasGenerated) {
-                        toggleOutput(o.id);
-                      }
-                    }}
-                    style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 20, border, background: bg, color, fontSize: 13, fontWeight: 500, cursor: "pointer", opacity: hasGenerated && !isReady ? 0.4 : 1, transition: "all 0.15s" }}
-                  >
-                    <span style={{ fontSize: 14 }}>{o.emoji}</span>
-                    {o.label}
-                    {isReady && !isActive && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#5b5bd6", display: "inline-block", marginLeft: 2 }} />}
-                  </button>
-                );
-              })}
+            <div style={{ background:"#fff", borderRadius:20, padding:"28px", border:"1px solid #e8e6e1" }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                <span style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", color:"#9ca3af", textTransform:"uppercase" }}>Kickoff Notes</span>
+                <span style={{ fontSize:12, color:"#9ca3af" }}>{notes.length > 0 ? `${notes.length} chars` : "Paste or type below"}</span>
+              </div>
+              <textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="Role title, team, salary range, key responsibilities, must-haves, interview process..." style={{ width:"100%", minHeight:160, background:OFF, border:"1.5px solid #e8e6e1", borderRadius:12, padding:"14px 16px", color:NAVY, fontSize:14, lineHeight:1.65, resize:"vertical", fontFamily:"inherit", boxSizing:"border-box", marginBottom:24 }}/>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+                <span style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", color:"#9ca3af", textTransform:"uppercase" }}>Outputs</span>
+                <button onClick={toggleAll} style={{ background:"none", border:"none", fontSize:12, color:MINT, fontWeight:600, cursor:"pointer", padding:0, fontFamily:"inherit" }}>{allSelected ? "Deselect all" : "Select all"}</button>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:20 }}>
+                {OUTPUTS.map(o => {
+                  const isOn = selected[o.id];
+                  return (
+                    <button key={o.id} onClick={() => toggleOutput(o.id)} className={`sg-toggle${isOn ? " on" : ""}`}
+                      style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 14px", borderRadius:10, border:`1.5px solid ${isOn ? MINT : "#e8e6e1"}`, background:isOn ? "#edfaf5" : "#fafaf9", color:isOn ? "#0a5c44" : "#6b7280", fontSize:13, fontWeight:500, cursor:"pointer", fontFamily:"inherit", textAlign:"left" }}>
+                      <span className="dot" style={{ width:8, height:8, borderRadius:"50%", background:isOn ? MINT : "#d1d5db", flexShrink:0, transition:"background .15s" }}/>
+                      {o.isAshby ? <AshbyLogo size={15}/> : <span style={{ fontSize:15 }}>{o.icon}</span>}
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={generate} disabled={!notes.trim() || !activeOutputs.length} className="sg-generate"
+                style={{ width:"100%", padding:"17px", background:notes.trim() && activeOutputs.length ? MINT : "#e5e7eb", color:notes.trim() && activeOutputs.length ? NAVY : "#9ca3af", border:"none", borderRadius:12, fontSize:15, fontWeight:700, cursor:notes.trim() && activeOutputs.length ? "pointer" : "not-allowed", transition:"all .2s", fontFamily:"inherit" }}>
+                Generate everything →
+              </button>
             </div>
-
-            <button
-              onClick={generate}
-              disabled={!notes.trim() || OUTPUTS.filter((o) => o.id !== "silver" && selected[o.id]).length === 0}
-              style={{
-                width: "100%", padding: "16px",
-                background: notes.trim() ? "linear-gradient(135deg, #f05a28 0%, #e8440a 100%)" : "#e8e8e8",
-                color: notes.trim() ? "#fff" : "#bbb",
-                border: "none", borderRadius: 10, fontSize: 15, fontWeight: 700,
-                cursor: notes.trim() ? "pointer" : "not-allowed", transition: "all 0.15s",
-              }}
-            >
-              {hasGenerated ? "Regenerate →" : "Generate everything →"}
-            </button>
           </div>
         )}
 
         {loading && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 300, gap: 16 }}>
-            <div style={{ width: 40, height: 40, borderRadius: "50%", border: "3px solid rgba(232,68,10,0.15)", borderTopColor: "#e8440a", animation: "spin 0.8s linear infinite" }} />
-            <p style={{ color: "#888", fontSize: 14 }}>{loadingStatus || "Generating your outputs…"}</p>
-            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:"60vh", gap:20 }}>
+            <div style={{ position:"relative", width:60, height:60 }}>
+              <div style={{ position:"absolute", inset:0, borderRadius:"50%", border:"3px solid rgba(62,207,163,.15)", borderTopColor:MINT, animation:"spin .9s linear infinite" }}/>
+              <div style={{ position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%)", width:10, height:10, borderRadius:"50%", background:MINT, animation:"pulse 1.5s ease-in-out infinite" }}/>
+            </div>
+            <p style={{ color:NAVY, fontWeight:600, fontSize:16, margin:0 }}>Working on it…</p>
           </div>
         )}
 
-        {error && (
-          <div style={{ background: "#fff5f2", border: "1px solid #ffd0c0", borderRadius: 10, padding: 16, color: "#e8440a", fontSize: 14, marginBottom: 16 }}>{error}</div>
-        )}
+        {error && !loading && <div style={{ background:"#fff5f2", border:"1px solid #fecaca", borderRadius:12, padding:16, color:"#dc2626", fontSize:14, marginTop:20 }}>{error}</div>}
 
-        {/* Output panel */}
-        {hasGenerated && !loading && activeTab && (
-          <div style={{ background: "#fff", border: "1px solid #e8e8e8", borderRadius: 14, overflow: "hidden" }}>
-            <div style={{ padding: "14px 20px", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ fontWeight: 600, fontSize: 15, color: "#1a1a2e" }}>{activeOutput?.emoji} {activeOutput?.label}</div>
-              {activeTab !== "silver" && generated[activeTab] && (
-                <button onClick={() => copySection(activeTab)} style={{ padding: "5px 14px", background: "#f7f7f7", border: "1px solid #e8e8e8", color: copiedSection === activeTab ? "#5b5bd6" : "#555", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>
-                  {copiedSection === activeTab ? "Copied ✓" : "Copy section"}
-                </button>
-              )}
+        {sections && !loading && (
+          <div className="fade">
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"36px 0 20px" }}>
+              <div>
+                <p style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:MINT, margin:"0 0 4px" }}>Done</p>
+                <h2 style={{ fontSize:24, fontWeight:700, margin:0, color:NAVY, letterSpacing:"-0.02em" }}>Your outputs</h2>
+              </div>
+              <button onClick={() => { setSections(null); setNotes(""); setAshbyResults(null); setAshbyError(null); }} className="sg-sec"
+                style={{ background:"#fff", border:"1.5px solid #e8e6e1", color:"#6b7280", fontSize:13, fontWeight:600, padding:"9px 18px", borderRadius:100, cursor:"pointer", fontFamily:"inherit" }}>← New role</button>
             </div>
 
-            {activeTab !== "silver" && (
-              <div style={{ padding: "24px", fontSize: 14, lineHeight: 1.8, color: "#1a1a2e", whiteSpace: "pre-wrap", minHeight: 200 }}>
-                {generated[activeTab] || "No content generated for this section."}
+            <div style={{ marginBottom:16 }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                <span style={{ fontSize:11, fontWeight:700, letterSpacing:"0.1em", color:"#9ca3af", textTransform:"uppercase" }}>Outputs</span>
+                <span style={{ fontSize:12, color:"#9ca3af" }}>{sections.length} generated</span>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                {sections.map(s => {
+                  const isAshby = s.isAshby, isActive = activeTab === s.id;
+                  return (
+                    <button key={s.id} onClick={() => setActiveTab(s.id)} className={`sg-tab${isActive ? " active" : ""}`}
+                      style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 14px", borderRadius:10, border:`1.5px solid ${isActive ? MINT : "#e8e6e1"}`, background:isActive ? "#edfaf5" : "#fff", color:isActive ? "#0a5c44" : "#6b7280", fontSize:13, fontWeight:500, fontFamily:"inherit", textAlign:"left" }}>
+                      <span className="tab-dot" style={{ width:8, height:8, borderRadius:"50%", background:isActive ? MINT : "#d1d5db", flexShrink:0 }}/>
+                      {isAshby ? <AshbyLogo size={15}/> : <span style={{ fontSize:15 }}>{s.icon}</span>}
+                      {s.label}
+                      {isAshby && ashbyLoading && <span style={{ marginLeft:"auto", width:14, height:14, borderRadius:"50%", border:"2px solid rgba(62,207,163,.2)", borderTopColor:MINT, animation:"spin .8s linear infinite", display:"inline-block" }}/>}
+                      {isAshby && ashbyResults && !ashbyLoading && <span style={{ marginLeft:"auto", fontSize:11, background:MINT, color:NAVY, padding:"2px 8px", borderRadius:100, fontWeight:700 }}>{ashbyResults.candidates.length}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {currentSection && !currentSection.isAshby && (
+              <div key={activeTab} className="fade">
+                <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10, padding:"10px 16px", background:"#edfaf5", borderRadius:10, border:`1px solid ${MINT}` }}>
+                  <span style={{ fontSize:17 }}>{currentSection.icon}</span>
+                  <span style={{ fontWeight:700, fontSize:14, color:"#0a5c44" }}>{currentSection.label}</span>
+                  <div style={{ flex:1 }}/>
+                  <button onClick={handleCopy} style={{ background:copied ? MINT : "#fff", border:`1px solid ${MINT}`, color:copied ? NAVY : "#0a5c44", fontSize:12, fontWeight:600, padding:"5px 14px", borderRadius:100, cursor:"pointer", fontFamily:"inherit" }}>{copied ? "✓ Copied" : "Copy this"}</button>
+                </div>
+                <div ref={contentRef} style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, padding:"24px 26px", fontSize:14, lineHeight:1.85, color:NAVY, whiteSpace:"pre-wrap", wordBreak:"break-word", maxHeight:520, overflowY:"auto" }}>{currentSection.content}</div>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginTop:12, gap:10 }}>
+                  <button disabled={tabIdx===0} onClick={() => tabIdx > 0 && setActiveTab(sections[tabIdx-1].id)} className="sg-sec" style={{ padding:"12px 20px", background:"#fff", border:"1.5px solid #e8e6e1", color:"#6b7280", borderRadius:12, fontSize:13, fontWeight:600, cursor:tabIdx===0?"not-allowed":"pointer", opacity:tabIdx===0?.4:1, fontFamily:"inherit" }}>← Previous</button>
+                  <button onClick={handleCopyAll} style={{ flex:1, padding:"12px", background:NAVY, border:"none", color:"#fff", borderRadius:12, fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"inherit" }}>Copy all outputs</button>
+                  <button disabled={tabIdx===sections.length-1} onClick={() => tabIdx < sections.length-1 && setActiveTab(sections[tabIdx+1].id)} className="sg-sec" style={{ padding:"12px 20px", background:"#fff", border:"1.5px solid #e8e6e1", color:"#6b7280", borderRadius:12, fontSize:13, fontWeight:600, cursor:tabIdx===sections.length-1?"not-allowed":"pointer", opacity:tabIdx===sections.length-1?.4:1, fontFamily:"inherit" }}>Next →</button>
+                </div>
               </div>
             )}
 
-            {activeTab === "silver" && (
-              <div style={{ padding: "16px" }}>
-                {generated.silver?.error && (
-                  <div style={{ color: "#e8440a", fontSize: 14, padding: 8 }}>{generated.silver.error}</div>
-                )}
-                {Array.isArray(generated.silver) && generated.silver.length === 0 && (
-                  <div style={{ color: "#888", fontSize: 14, padding: 8 }}>No silver medallist candidates found in Ashby.</div>
-                )}
-                {Array.isArray(generated.silver) && generated.silver.length > 0 && (
-                  <>
-                    <p style={{ fontSize: 13, color: "#888", margin: "0 0 14px" }}>
-                      {generated.silver.length} candidates ranked by match — passed screening call, excluded poor culture fit
-                    </p>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                      {generated.silver.map((c, i) => (
-                        <div key={c.id || i} style={{ border: "1px solid #e8e8e8", borderRadius: 10, overflow: "hidden" }}>
-                          <div onClick={() => setExpandedCandidate(expandedCandidate === i ? null : i)}
-                            style={{ padding: "12px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
-                            <div style={{ width: 26, height: 26, borderRadius: "50%", background: i === 0 ? "#fef9c3" : "#f7f7f7", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#555", flexShrink: 0 }}>{i + 1}</div>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div style={{ fontWeight: 600, fontSize: 14, color: "#1a1a2e" }}>{c.name}</div>
-                              <div style={{ fontSize: 12, color: "#888", marginTop: 1 }}>
-                                {[c.currentTitle, c.currentCompany].filter(Boolean).join(" · ")}
-                                {c.previousRole && <span style={{ color: "#bbb" }}> · Previously: {c.previousRole}</span>}
-                              </div>
-                            </div>
-                            <div style={{ background: scoreBg(c.matchScore), color: scoreColor(c.matchScore), fontSize: 12, fontWeight: 700, padding: "3px 9px", borderRadius: 16, flexShrink: 0 }}>{c.matchScore}%</div>
-                            <div style={{ fontSize: 11, color: "#bbb", flexShrink: 0 }}>{expandedCandidate === i ? "▲" : "▼"}</div>
-                          </div>
+            {currentSection?.isAshby && (
+              <div key="silver" className="fade">
+                <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12, padding:"10px 16px", background:"#edfaf5", borderRadius:10, border:`1px solid ${MINT}` }}>
+                  <AshbyLogo size={16}/>
+                  <div><span style={{ fontWeight:700, fontSize:14, color:"#0a5c44" }}>Silver Medalists</span><span style={{ fontSize:12, color:"#6b7280", marginLeft:8 }}>Candidates who reached Technical Interview or beyond</span></div>
+                  <div style={{ flex:1 }}/>
+                  {ashbyKeySaved && ashbyResults && !ashbyLoading && <button onClick={() => doAshbySearch(ashbyKey)} style={{ fontSize:12, fontWeight:600, color:MINT, background:"none", border:`1px solid ${MINT}`, borderRadius:100, padding:"4px 12px", cursor:"pointer", fontFamily:"inherit" }}>Refresh</button>}
+                </div>
 
-                          {expandedCandidate === i && (
-                            <div style={{ borderTop: "1px solid #f0f0f0", padding: "14px", background: "#fafafa" }}>
-                              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 12 }}>
-                                {c.email && <div><div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 2 }}>Email</div><a href={`mailto:${c.email}`} style={{ fontSize: 13, color: "#5b5bd6", textDecoration: "none" }}>{c.email}</a></div>}
-                                {c.stageReached && <div><div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 2 }}>Stage Reached</div><div style={{ fontSize: 13 }}>{c.stageReached}</div></div>}
-                                {c.appliedAt && <div><div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 2 }}>Applied</div><div style={{ fontSize: 13 }}>{c.appliedAt}</div></div>}
-                                {c.archiveReason && <div><div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 2 }}>Archive Reason</div><div style={{ fontSize: 13 }}>{c.archiveReason}</div></div>}
-                              </div>
-                              {c.matchReason && <div style={{ marginBottom: 12 }}><div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 4 }}>Why they match</div><div style={{ fontSize: 13, color: "#444", lineHeight: 1.6 }}>{c.matchReason}</div></div>}
-                              {c.suggestedOutreach && (
-                                <div>
-                                  <div style={{ fontSize: 10, fontWeight: 700, color: "#aaa", textTransform: "uppercase", marginBottom: 4 }}>Re-engagement message</div>
-                                  <div style={{ background: "#fff", border: "1px solid #e8e8e8", borderRadius: 8, padding: "10px 12px", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", marginBottom: 8 }}>{c.suggestedOutreach}</div>
-                                  <button onClick={() => navigator.clipboard.writeText(c.suggestedOutreach)} style={{ padding: "5px 12px", background: "#fff", border: "1px solid #e8e8e8", color: "#555", borderRadius: 8, fontSize: 12, cursor: "pointer" }}>Copy message</button>
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      ))}
+                {!ashbyKeySaved && (
+                  <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, padding:"44px 28px", textAlign:"center" }}>
+                    <AshbyLogo size={40}/>
+                    <p style={{ fontWeight:700, fontSize:16, margin:"14px 0 6px", color:NAVY }}>Connect Ashby</p>
+                    <p style={{ fontSize:14, color:"#6b7280", margin:"0 0 24px", lineHeight:1.6 }}>Enter your Ashby API key to search for silver medalists.</p>
+                    <div style={{ display:"flex", gap:8, maxWidth:380, margin:"0 auto" }}>
+                      <input type="password" value={ashbyKeyInput} onChange={e => setAshbyKeyInput(e.target.value)} placeholder="ashby_api_key_••••••••" onKeyDown={e => { if (e.key==="Enter") { saveAshbyKey(); if (ashbyKeyInput.trim()) doAshbySearch(ashbyKeyInput.trim()); }}} style={{ flex:1, fontSize:13, padding:"10px 14px", border:"1.5px solid #e8e6e1", borderRadius:10, fontFamily:"inherit", background:OFF, color:NAVY }}/>
+                      <button onClick={() => { saveAshbyKey(); if (ashbyKeyInput.trim()) doAshbySearch(ashbyKeyInput.trim()); }} style={{ fontSize:13, fontWeight:700, color:NAVY, background:MINT, border:"none", borderRadius:10, padding:"10px 18px", cursor:"pointer", fontFamily:"inherit" }}>Search</button>
                     </div>
-                  </>
+                  </div>
+                )}
+
+                {ashbyKeySaved && ashbyLoading && (
+                  <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, padding:"48px 28px", textAlign:"center" }}>
+                    <div style={{ width:40, height:40, borderRadius:"50%", border:"3px solid rgba(62,207,163,.15)", borderTopColor:MINT, animation:"spin .9s linear infinite", margin:"0 auto 16px" }}/>
+                    <p style={{ color:NAVY, fontWeight:600, fontSize:15, margin:"0 0 6px" }}>{ashbyProgress || "Searching Ashby…"}</p>
+                    <p style={{ color:"#9ca3af", fontSize:13, margin:0 }}>Checking active, paused and archived jobs for similar titles</p>
+                  </div>
+                )}
+
+                {ashbyKeySaved && ashbyError && !ashbyLoading && (
+                  <div style={{ background:"#fff", border:"1px solid #fecaca", borderRadius:16, padding:"24px 28px" }}>
+                    <p style={{ color:"#dc2626", fontWeight:700, fontSize:14, margin:"0 0 6px" }}>Search failed</p>
+                    <p style={{ color:"#dc2626", fontSize:13, margin:"0 0 16px", lineHeight:1.5 }}>{ashbyError}</p>
+                    <button onClick={() => doAshbySearch(ashbyKey)} style={{ fontSize:13, fontWeight:600, color:NAVY, background:MINT, border:"none", borderRadius:8, padding:"9px 18px", cursor:"pointer", fontFamily:"inherit" }}>Try again</button>
+                  </div>
+                )}
+
+                {ashbyResults && !ashbyLoading && (
+                  <div>
+                    <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:12, padding:"14px 18px", marginBottom:12 }}>
+                      <p style={{ fontSize:11, fontWeight:700, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.08em", margin:"0 0 8px" }}>Searched job titles</p>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                        {ashbyResults.allTitles.slice(0,10).map(t => <span key={t} className="title-pill">{t}</span>)}
+                      </div>
+                      {ashbyResults.matchedJobs.length > 0 && <p style={{ fontSize:12, color:"#6b7280", margin:"10px 0 0" }}>Matched <strong>{ashbyResults.matchedJobs.length}</strong> job{ashbyResults.matchedJobs.length !== 1?"s":""} across {ashbyResults.totalApps} total applications</p>}
+                    </div>
+                    {ashbyResults.candidates.length === 0 ? (
+                      <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, padding:"44px 28px", textAlign:"center" }}>
+                        <p style={{ fontSize:22 }}>🔍</p>
+                        <p style={{ fontSize:15, fontWeight:600, color:NAVY, margin:"8px 0 6px" }}>No silver medalists found</p>
+                        <p style={{ fontSize:13, color:"#6b7280", margin:0, lineHeight:1.6 }}>{ashbyResults.matchedJobs.length === 0 ? "No jobs with similar titles found in Ashby." : "No archived candidates who reached Technical Interview or beyond found for these roles."}</p>
+                      </div>
+                    ) : (
+                      <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, overflow:"hidden" }}>
+                        <div style={{ display:"grid", gridTemplateColumns:"1.2fr 1fr 1fr 72px", padding:"10px 20px", borderBottom:"1px solid #e8e6e1", background:OFF }}>
+                          {["Candidate","Applied for","Stage reached",""].map(h => <span key={h} style={{ fontSize:11, fontWeight:700, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.07em" }}>{h}</span>)}
+                        </div>
+                        {ashbyResults.candidates.map((app, i) => {
+                          const name  = app.candidateName || app.candidate?.name || "Unknown";
+                          const job   = app._jobTitle || app.job?.title || "—";
+                          const stage = app._stageFound || app.currentInterviewStageName || "—";
+                          const cId   = app.candidateId || app.candidate?.id;
+                          const url   = cId ? `https://app.ashbyhq.com/candidates/${cId}` : null;
+                          return (
+                            <div key={app.id||i} className="cand-row" style={{ display:"grid", gridTemplateColumns:"1.2fr 1fr 1fr 72px", padding:"13px 20px", borderBottom:i<ashbyResults.candidates.length-1?"1px solid #f3f3f0":"none", alignItems:"center", background:"#fff", transition:"background .1s" }}>
+                              <p style={{ fontSize:14, fontWeight:600, color:NAVY, margin:0 }}>{name}</p>
+                              <p style={{ fontSize:13, color:"#6b7280", margin:0, paddingRight:8 }}>{job}</p>
+                              <span style={{ fontSize:11, padding:"3px 9px", borderRadius:100, fontWeight:600, display:"inline-block", background:"#edfaf5", color:"#0a5c44", border:`1px solid ${MINT}` }}>{stage}</span>
+                              {url ? <a href={url} target="_blank" rel="noreferrer" style={{ fontSize:12, fontWeight:700, color:MINT, textDecoration:"none" }}>View ↗</a> : <span/>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {ashbyKeySaved && !ashbyLoading && !ashbyResults && !ashbyError && (
+                  <div style={{ background:"#fff", border:"1px solid #e8e6e1", borderRadius:16, padding:"44px 28px", textAlign:"center" }}>
+                    <button onClick={() => doAshbySearch(ashbyKey)} style={{ fontSize:14, fontWeight:700, color:NAVY, background:MINT, border:"none", borderRadius:12, padding:"14px 28px", cursor:"pointer", fontFamily:"inherit" }}>Search Ashby now</button>
+                  </div>
                 )}
               </div>
             )}
           </div>
-        )}
-
-        {hasGenerated && !loading && generated._raw && (
-          <button onClick={() => navigator.clipboard.writeText(generated._raw)} style={{ marginTop: 12, width: "100%", padding: "13px", background: "#fff", border: "1px solid #e8e8e8", color: "#555", borderRadius: 10, fontSize: 14, fontWeight: 500, cursor: "pointer" }}>
-            Copy all outputs
-          </button>
         )}
       </div>
     </div>
